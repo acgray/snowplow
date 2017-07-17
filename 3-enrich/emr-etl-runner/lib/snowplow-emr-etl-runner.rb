@@ -1,4 +1,4 @@
-# Copyright (c) 2012-2015 Snowplow Analytics Ltd. All rights reserved.
+# Copyright (c) 2012-2017 Snowplow Analytics Ltd. All rights reserved.
 #
 # This program is licensed to you under the Apache License Version 2.0,
 # and you may not use this file except in compliance with the Apache License Version 2.0.
@@ -20,14 +20,14 @@ require_relative 'snowplow-emr-etl-runner/monitoring/logging'
 require_relative 'snowplow-emr-etl-runner/monitoring/snowplow'
 require_relative 'snowplow-emr-etl-runner/cli'
 require_relative 'snowplow-emr-etl-runner/s3_tasks'
-require_relative 'snowplow-emr-etl-runner/scalding_step'
 require_relative 'snowplow-emr-etl-runner/job_result'
 require_relative 'snowplow-emr-etl-runner/emr_job'
 require_relative 'snowplow-emr-etl-runner/runner'
 
+
 module Snowplow
   module EmrEtlRunner
     NAME          = "snowplow-emr-etl-runner"
-    VERSION       = "0.22.0"
+    VERSION       = "0.25.0"
   end
 end

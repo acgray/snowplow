@@ -1,4 +1,4 @@
-# Copyright (c) 2012-2014 Snowplow Analytics Ltd. All rights reserved.
+# Copyright (c) 2012-2017 Snowplow Analytics Ltd. All rights reserved.
 #
 # This program is licensed to you under the Apache License Version 2.0,
 # and you may not use this file except in compliance with the Apache License Version 2.0.
@@ -20,6 +20,7 @@ require 'awrence'
 require 'json'
 require 'base64'
 require 'contracts'
+require 'iglu-client'
 
 # Global variable used to decide whether to patch Elasticity's AwsRequestV4 payload with Configurations
 # This is only necessary if we are loading Thrift with AMI >= 4.0.0
@@ -69,8 +70,8 @@ module Snowplow
       include Monitoring::Logging
 
       # Initializes our wrapper for the Amazon EMR client.
-      Contract Bool, Bool, Bool, Bool, Bool, ConfigHash, ArrayOf[String], String => EmrJob
-      def initialize(debug, enrich, shred, elasticsearch, s3distcp, config, enrichments_array, resolver)
+      Contract Bool, Bool, Bool, Bool, Bool, Bool, ConfigHash, ArrayOf[String], String, TargetsHash => EmrJob
+      def initialize(debug, enrich, shred, elasticsearch, s3distcp, archive_raw, config, enrichments_array, resolver, targets)
 
         logger.debug "Initializing EMR jobflow"
 
@@ -78,9 +79,9 @@ module Snowplow
         custom_assets_bucket = self.class.get_hosted_assets_bucket(config[:aws][:s3][:buckets][:assets], config[:aws][:emr][:region])
         assets = self.class.get_assets(
           custom_assets_bucket,
-          config[:enrich][:versions][:hadoop_enrich],
-          config[:enrich][:versions][:hadoop_shred],
-          config[:enrich][:versions][:hadoop_elasticsearch])
+          config[:enrich][:versions][:spark_enrich],
+          config[:storage][:versions][:rdb_shredder],
+          config[:storage][:versions][:hadoop_elasticsearch])
 
         run_tstamp = Time.new
         run_id = run_tstamp.strftime("%Y-%m-%d-%H-%M-%S")
@@ -93,15 +94,6 @@ module Snowplow
           config[:aws][:access_key_id],
           config[:aws][:secret_access_key])
 
-        # Check whether there are an even number of .lzo and .lzo.index files
-        if config[:collectors][:format] == 'thrift'
-          processing_location = Sluice::Storage::S3::Location.new(config[:aws][:s3][:buckets][:raw][:processing])
-          processing_file_count = Sluice::Storage::S3.list_files(s3, processing_location).size
-          unless processing_file_count % 2 == 0
-            raise UnmatchedLzoFilesError, "Processing bucket contains #{processing_file_count} .lzo and .lzo.index files, expected an even number"
-          end
-        end
-
         # Configure Elasticity with your AWS credentials
         Elasticity.configure do |c|
           c.access_key = config[:aws][:access_key_id]
@@ -112,7 +104,7 @@ module Snowplow
         @jobflow = Elasticity::JobFlow.new
 
         # Configure
-        @jobflow.name                 = config[:enrich][:job_name]
+        @jobflow.name                 = config[:aws][:emr][:jobflow][:job_name]
 
         if config[:aws][:emr][:ami_version] =~ /^[1-3].*/
           @legacy = true
@@ -142,6 +134,28 @@ module Snowplow
         @jobflow.master_instance_type = config[:aws][:emr][:jobflow][:master_instance_type]
         @jobflow.slave_instance_type  = config[:aws][:emr][:jobflow][:core_instance_type]
 
+        unless config[:aws][:emr][:jobflow][:core_instance_ebs].nil?
+          ebs_bdc = Elasticity::EbsBlockDeviceConfig.new
+
+          ebs_bdc.volume_type          = config[:aws][:emr][:jobflow][:core_instance_ebs][:volume_type]
+          ebs_bdc.size_in_gb           = config[:aws][:emr][:jobflow][:core_instance_ebs][:volume_size]
+          ebs_bdc.volumes_per_instance = 1
+          if config[:aws][:emr][:jobflow][:core_instance_ebs][:volume_type] == "io1"
+            ebs_bdc.iops = config[:aws][:emr][:jobflow][:core_instance_ebs][:volume_iops]
+          end
+
+          ebs_c = Elasticity::EbsConfiguration.new
+          ebs_c.add_ebs_block_device_config(ebs_bdc)
+          ebs_c.ebs_optimized = true
+
+          unless config[:aws][:emr][:jobflow][:core_instance_ebs][:ebs_optimized].nil?
+            ebs_c.ebs_optimized = config[:aws][:emr][:jobflow][:core_instance_ebs][:ebs_optimized]
+          end
+
+          @jobflow.set_core_ebs_configuration(ebs_c)
+        end
+        @jobflow.add_application("Hadoop")
+
         if config[:collectors][:format] == 'thrift'
           if @legacy
             [
@@ -170,7 +184,7 @@ module Snowplow
         else
           "#{standard_assets_bucket}common/emr/snowplow-ami4-bootstrap-0.2.0.sh"
         end
-        cc_version = get_cc_version(config[:enrich][:versions][:hadoop_enrich])
+        cc_version = get_cc_version(config[:enrich][:versions][:spark_enrich])
         @jobflow.add_bootstrap_action(Elasticity::BootstrapAction.new(bootstrap_jar_location, cc_version))
 
         # Install and launch HBase
@@ -280,21 +294,40 @@ module Snowplow
             enrich_final_output
           end
 
-          enrich_step = build_scalding_step(
-            "Enrich Raw Events",
-            assets[:enrich],
-            "enrich.hadoop.EtlJob",
-            { :in     => enrich_step_input,
-              :good   => enrich_step_output,
-              :bad    => self.class.partition_by_run(csbe[:bad],    run_id),
-              :errors => self.class.partition_by_run(csbe[:errors], run_id, config[:enrich][:continue_on_unexpected_error])
-            },
-            { :input_format     => config[:collectors][:format],
-              :etl_tstamp       => etl_tstamp,
-              :iglu_config      => self.class.build_iglu_config_json(resolver),
-              :enrichments      => self.class.build_enrichments_json(enrichments_array)
-            }
-          )
+          enrich_step =
+            if self.class.is_spark_enrich(config[:enrich][:versions][:spark_enrich]) then
+              @jobflow.add_application("Spark")
+              build_spark_step(
+                "Enrich Raw Events",
+                assets[:enrich],
+                "enrich.spark.EnrichJob",
+                { :in     => enrich_step_input,
+                  :good   => enrich_step_output,
+                  :bad    => self.class.partition_by_run(csbe[:bad],    run_id)
+                },
+                { 'input-format'    => config[:collectors][:format],
+                  'etl-timestamp'   => etl_tstamp,
+                  'iglu-config'     => self.class.build_iglu_config_json(resolver),
+                  'enrichments'     => self.class.build_enrichments_json(enrichments_array)
+                }
+              )
+            else
+              build_scalding_step(
+                "Enrich Raw Events",
+                assets[:enrich],
+                "enrich.hadoop.EtlJob",
+                { :in     => enrich_step_input,
+                  :good   => enrich_step_output,
+                  :bad    => self.class.partition_by_run(csbe[:bad],    run_id),
+                  :errors => self.class.partition_by_run(csbe[:errors], run_id, config[:enrich][:continue_on_unexpected_error])
+                },
+                { :input_format     => config[:collectors][:format],
+                  :etl_tstamp       => etl_tstamp,
+                  :iglu_config      => self.class.build_iglu_config_json(resolver),
+                  :enrichments      => self.class.build_enrichments_json(enrichments_array)
+                }
+              )
+            end
 
           # Late check whether our enrichment directory is empty. We do an early check too
           csbe_good_loc = Sluice::Storage::S3::Location.new(csbe[:good])
@@ -352,19 +385,39 @@ module Snowplow
             @jobflow.add_step(copy_to_hdfs_step)
           end
 
-          shred_step = build_scalding_step(
-            "Shred Enriched Events",
-            assets[:shred],
-            "enrich.hadoop.ShredJob",
-            { :in          => enrich_step_output,
-              :good        => shred_step_output,
-              :bad         => self.class.partition_by_run(csbs[:bad],    run_id),
-              :errors      => self.class.partition_by_run(csbs[:errors], run_id, config[:enrich][:continue_on_unexpected_error])
-            },
-            {
-              :iglu_config => self.class.build_iglu_config_json(resolver)
-            }
-          )
+
+          shred_step =
+            if self.class.is_rdb_shredder(config[:storage][:versions][:rdb_shredder]) then
+              duplicate_storage_config = self.class.build_duplicate_storage_json(targets[:DUPLICATE_TRACKING], false)
+              @jobflow.add_application("Spark")
+              build_spark_step(
+                "Shred Enriched Events",
+                assets[:shred],
+                "storage.spark.ShredJob",
+                { :in   => enrich_step_output,
+                  :good => shred_step_output,
+                  :bad  => self.class.partition_by_run(csbs[:bad], run_id)
+                },
+                { 
+                  'iglu-config' => self.class.build_iglu_config_json(resolver) 
+                }.merge(duplicate_storage_config)
+              )
+            else
+              duplicate_storage_config = self.class.build_duplicate_storage_json(targets[:DUPLICATE_TRACKING])
+              build_scalding_step(
+                "Shred Enriched Events",
+                assets[:shred],
+                "enrich.hadoop.ShredJob",
+                { :in          => enrich_step_output,
+                  :good        => shred_step_output,
+                  :bad         => self.class.partition_by_run(csbs[:bad],    run_id),
+                  :errors      => self.class.partition_by_run(csbs[:errors], run_id, config[:enrich][:continue_on_unexpected_error])
+                },
+                {
+                  :iglu_config => self.class.build_iglu_config_json(resolver)
+                }.merge(duplicate_storage_config)
+              )
+            end
 
           # Late check whether our target directory is empty
           csbs_good_loc = Sluice::Storage::S3::Location.new(csbs[:good])
@@ -388,9 +441,22 @@ module Snowplow
         end
 
         if elasticsearch
-          get_elasticsearch_steps(config, assets, enrich, shred).each do |step|
+          get_elasticsearch_steps(config, assets, enrich, shred, targets[:FAILED_EVENTS]).each do |step|
             @jobflow.add_step(step)
           end
+        end
+
+        if archive_raw
+          # We need to copy our enriched events from HDFS back to S3
+          archive_raw_step = Elasticity::S3DistCpStep.new(legacy = @legacy)
+          archive_raw_step.arguments = [
+            "--src"        , csbr[:processing],
+            "--dest"       , self.class.partition_by_run(csbr[:archive], run_id),
+            "--s3Endpoint" , s3_endpoint,
+            "--deleteOnSuccess"
+          ]
+          archive_raw_step.name << ": Raw S3 Staging -> S3 Archive"
+          @jobflow.add_step(archive_raw_step)
         end
 
         self
@@ -398,33 +464,30 @@ module Snowplow
 
       # Create one step for each Elasticsearch target for each source for that target
       #
-      Contract ConfigHash, Hash, Bool, Bool => ArrayOf[ScaldingStep]
-      def get_elasticsearch_steps(config, assets, enrich, shred)
-        elasticsearch_targets = config[:storage][:targets].select {|t| t[:type] == 'elasticsearch'}
+      Contract ConfigHash, Hash, Bool, Bool, ArrayOf[Iglu::SelfDescribingJson] => ArrayOf[Elasticity::ScaldingStep]
+      def get_elasticsearch_steps(config, assets, enrich, shred, failure_storages)
 
         # The default sources are the enriched and shredded errors generated for this run
-        default_sources = []
-        default_sources << self.class.partition_by_run(config[:aws][:s3][:buckets][:enriched][:bad], @run_id) if enrich
-        default_sources << self.class.partition_by_run(config[:aws][:s3][:buckets][:shredded][:bad], @run_id) if shred
+        sources = []
+        sources << self.class.partition_by_run(config[:aws][:s3][:buckets][:enriched][:bad], @run_id) if enrich
+        sources << self.class.partition_by_run(config[:aws][:s3][:buckets][:shredded][:bad], @run_id) if shred
 
-        steps = elasticsearch_targets.flat_map { |target|
-
-          sources = target[:sources] || default_sources
+        steps = failure_storages.flat_map { |target|
 
           sources.map { |source|
-            step = ScaldingStep.new(
+            step = Elasticity::ScaldingStep.new(
               assets[:elasticsearch],
               "com.snowplowanalytics.snowplow.storage.hadoop.ElasticsearchJob",
               ({
                 :input => source,
-                :host => target[:host],
-                :port => target[:port].to_s,
-                :index => target[:database],
-                :type => target[:table],
-                :es_nodes_wan_only => target[:es_nodes_wan_only] ? "true" : "false"
+                :host => target.data[:host],
+                :port => target.data[:port].to_s,
+                :index => target.data[:index],
+                :type => target.data[:type],
+                :es_nodes_wan_only => target.data[:nodesWanOnly] ? "true" : "false"
               }).reject { |k, v| v.nil? }
             )
-            step_name = "Errors in #{source} -> Elasticsearch: #{target[:name]}"
+            step_name = "Errors in #{source} -> Elasticsearch: #{target.data[:name]}"
             step.name << ": #{step_name}"
             step
           }
@@ -480,17 +543,17 @@ module Snowplow
 
     private
 
-      # Defines a Scalding data processing job as an Elasticity
-      # jobflow step.
+      # Defines an Elasticity Scalding step.
       #
       # Parameters:
       # +step_name+:: name of step
       # +main_class+:: Java main class to run
       # +folders+:: hash of in, good, bad, errors S3/HDFS folders
       # +extra_step_args+:: additional arguments to pass to the step
+      # +targets+:: list of targets parsed from self-describing JSONs
       #
-      # Returns a step ready for adding to the jobflow.
-      Contract String, String, String, Hash, Hash => ScaldingStep
+      # Returns a step ready for adding to the Elasticity Jobflow.
+      Contract String, String, String, Hash, Hash => Elasticity::ScaldingStep
       def build_scalding_step(step_name, jar, main_class, folders, extra_step_args={})
 
         # Build our argument hash
@@ -504,10 +567,37 @@ module Snowplow
           .reject { |k, v| v.nil? } # Because folders[:errors] may be empty
 
         # Now create the Hadoop MR step for the jobflow
-        scalding_step = ScaldingStep.new(jar, "#{JAVA_PACKAGE}.#{main_class}", arguments)
+        scalding_step = Elasticity::ScaldingStep.new(jar, "#{JAVA_PACKAGE}.#{main_class}", arguments)
         scalding_step.name << ": #{step_name}"
 
         scalding_step
+      end
+
+      # Defines an Elasticity Spark step.
+      #
+      # Parameters:
+      # +step_name+:: name of the step
+      # +main_class+:: class to run
+      # +folders+:: hash of input, output, bad S3/HDFS folders
+      # +extra_step_args+:: additional command line arguments to pass to the step
+      #
+      # Returns a step read to be added to the Elasticity Jobflow.
+      Contract String, String, String, Hash, Hash => Elasticity::SparkStep
+      def build_spark_step(step_name, jar, main_class, folders, extra_step_args={})
+        arguments = extra_step_args
+          .merge({
+            'input-folder'  => folders[:in],
+            'output-folder' => folders[:good],
+            'bad-folder'    => folders[:bad],
+          })
+        spark_step = Elasticity::SparkStep.new(jar, "#{JAVA_PACKAGE}.#{main_class}")
+        spark_step.app_arguments = arguments
+        spark_step.spark_arguments = {
+          'master' => 'yarn',
+          'deploy-mode' => 'cluster'
+        }
+        spark_step.name << ": #{step_name}"
+        spark_step
       end
 
       # Get commons-codec version required by Scala Hadoop Enrich
@@ -567,6 +657,12 @@ module Snowplow
             sleep(300)
           rescue RestClient::InternalServerError => ise
             logger.warn "Got internal server error #{ise}, waiting 5 minutes before checking jobflow again"
+            sleep(300)
+          rescue Elasticity::ThrottlingException => te
+            logger.warn "Got Elasticity throttling exception #{te}, waiting 5 minutes before checking jobflow again"
+            sleep(300)
+          rescue ArgumentError => ae
+            logger.warn "Got Elasticity argument error #{ae}, waiting 5 minutes before checking jobflow again"
             sleep(300)
           rescue IOError => ioe
             logger.warn "Got IOError #{ioe}, waiting 5 minutes before checking jobflow again"
@@ -698,6 +794,21 @@ module Snowplow
         Base64.strict_encode64(resolver)
       end
 
+      Contract Maybe[Iglu::SelfDescribingJson], Bool => Hash
+      def self.build_duplicate_storage_json(target, snake_case=true)
+        if target.nil?
+          {}
+        else
+          encoded = Base64.strict_encode64(target.to_json.to_json)
+          if snake_case
+            { :duplicate_storage_config => encoded }
+          else
+            { 'duplicate-storage-config' => encoded }
+          end
+        end
+
+      end
+
       # Builds the region-appropriate bucket name for Snowplow's
       # hosted assets. Has to be region-specific because of
       # https://github.com/boto/botocore/issues/424
@@ -712,12 +823,57 @@ module Snowplow
         "#{bucket}#{suffix}/"
       end
 
+      # Check if the supplied shred version relates to the rdb-shredder or the
+      # legacy scala-hadoop-shred.
+      #
+      # Parameters:
+      # +shred_version+:: the specified shred version
+      Contract String => Bool
+      def self.is_rdb_shredder(shred_version)
+        version = shred_version.split('.').map { |v| v.to_i }
+        unless version.length == 3
+          raise ArgumentError, 'The shred job version could not be parsed'
+        end
+        version[1] >= 12
+      end
+
+      # Check if the supplied enrich version relates to spark enrich or the legacy
+      # scala-hadoop-enrich.
+      #
+      # Parameters:
+      # +enrich_version+:: the specified enrich version
+      Contract String => Bool
+      def self.is_spark_enrich(enrich_version)
+        version = enrich_version.split('.').map { |v| v.to_i }
+        unless version.length == 3
+          raise ArgumentError, 'The enrich job version could not be parsed'
+        end
+        version[0] >= 1 && version[1] >= 9
+      end
+
+      # Retrieve the s3 paths of the needed assets: Spark enrich, RDB Shredder and
+      # the Hadoop Elasticsearch sink.
+      #
+      # Parameters:
+      # +assets_bucket+:: the s3 bucket where the assets are supposed to be located
+      # +spark_enrich_version+:: version of the Spark enrich job to use
+      # +rds_version+:: version of the rdb shredder job to use
+      # +hadoop_elasticsearch_version+:: version of the Hadoop Elasticsearch sink to use
       Contract String, String, String, String => AssetsHash
-      def self.get_assets(assets_bucket, hadoop_enrich_version, hadoop_shred_version, hadoop_elasticsearch_version)
-        enrich_path_middle = hadoop_enrich_version[0] == '0' ? 'hadoop-etl/snowplow-hadoop-etl' : 'scala-hadoop-enrich/snowplow-hadoop-enrich'
+      def self.get_assets(assets_bucket, spark_enrich_version, rds_version, hadoop_elasticsearch_version)
+        enrich_path_middle = if is_spark_enrich(spark_enrich_version)
+          'spark-enrich/snowplow-spark-enrich'
+        else
+          spark_enrich_version[0] == '0' ? 'hadoop-etl/snowplow-hadoop-etl' : 'scala-hadoop-enrich/snowplow-hadoop-enrich'
+        end
+        shred_path = if is_rdb_shredder(rds_version) then
+          '4-storage/rdb-shredder/snowplow-rdb-shredder-'
+        else
+          '3-enrich/scala-hadoop-shred/snowplow-hadoop-shred-'
+        end
         {
-          :enrich   => "#{assets_bucket}3-enrich/#{enrich_path_middle}-#{hadoop_enrich_version}.jar",
-          :shred    => "#{assets_bucket}3-enrich/scala-hadoop-shred/snowplow-hadoop-shred-#{hadoop_shred_version}.jar",
+          :enrich   => "#{assets_bucket}3-enrich/#{enrich_path_middle}-#{spark_enrich_version}.jar",
+          :shred    => "#{assets_bucket}#{shred_path}#{rds_version}.jar",
           :elasticsearch => "#{assets_bucket}4-storage/hadoop-elasticsearch-sink/hadoop-elasticsearch-sink-#{hadoop_elasticsearch_version}.jar",
         }
       end
@@ -750,7 +906,6 @@ module Snowplow
           codec == "gzip" ? "gz" : codec
         end
       end
-
     end
   end
 end

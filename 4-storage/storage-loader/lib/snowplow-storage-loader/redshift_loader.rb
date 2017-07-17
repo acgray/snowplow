@@ -1,4 +1,4 @@
-# Copyright (c) 2012-2014 Snowplow Analytics Ltd. All rights reserved.
+# Copyright (c) 2012-2017 Snowplow Analytics Ltd. All rights reserved.
 #
 # This program is licensed to you under the Apache License Version 2.0,
 # and you may not use this file except in compliance with the Apache License Version 2.0.
@@ -30,7 +30,11 @@ module Snowplow
       ALTERED_ENRICHED_PATTERN = /(run=[0-9\-]+\/atomic-events)/
 
       # Versions 0.5.0 and earlier of Hadoop Shred don't copy atomic.events into the shredded bucket
-      OLD_ENRICHED_PATTERN = /0\.[0-5]\.[0-9]/
+      OLD_ENRICHED_PATTERN = /0\.[0-5]\.[0-9](-rc[0-9]+|)/
+
+      # Versions 0.11.0 and earlier of the rdb shredder didn't use the field names when writing
+      # shredded types
+      OLD_SHRED_PATTERN = /0\.([0-9]|1[0-1])\.[0-9](-rc[0-9]+|)/
 
       SqlStatements = Struct.new(:copy, :analyze, :vacuum)
 
@@ -50,13 +54,23 @@ module Snowplow
           config[:aws][:access_key_id],
           config[:aws][:secret_access_key])
 
+        schema = target[:schema]
+        events_table = schema + '.events'
+
         # First let's get our statements for shredding (if any)
-        shredded_statements = get_shredded_statements(config, target, s3)
+        shredded_statements = if OLD_SHRED_PATTERN.match(config[:storage][:versions][:rdb_shredder])
+          get_shredded_statements(config, target, s3, true)
+        else
+          get_shredded_statements(config, target, s3)
+        end
+
+        # Now let's get the manifest statement
+        manifest_statement = get_manifest_statement(schema, shredded_statements.length)
 
         # Build our main transaction, consisting of COPY and COPY FROM JSON
         # statements, and potentially also a set of table ANALYZE statements.
 
-        atomic_events_location = if OLD_ENRICHED_PATTERN.match(config[:enrich][:versions][:hadoop_shred])
+        atomic_events_location = if OLD_ENRICHED_PATTERN.match(config[:storage][:versions][:rdb_shredder])
           :enriched
         else
           :shredded
@@ -72,10 +86,10 @@ module Snowplow
           end
           # Of the form "run=xxx/atomic-events"
           altered_enriched_subdirectory = ALTERED_ENRICHED_PATTERN.match(altered_enriched_filepath.key)[1]
-          [build_copy_from_tsv_statement(config, config[:aws][:s3][:buckets][:shredded][:good] + altered_enriched_subdirectory, target[:table], target[:maxerror])]
+          [build_copy_from_tsv_statement(config, config[:aws][:s3][:buckets][:shredded][:good] + altered_enriched_subdirectory, events_table, target[:maxError].to_i)]
         else
-          [build_copy_from_tsv_statement(config, config[:aws][:s3][:buckets][:enriched][:good], target[:table], target[:maxerror])]
-        end + shredded_statements.map(&:copy)
+          [build_copy_from_tsv_statement(config, config[:aws][:s3][:buckets][:enriched][:good], events_table, target[:maxError].to_i)]
+        end + shredded_statements.map(&:copy) + [manifest_statement]
 
         credentials = [config[:aws][:access_key_id], config[:aws][:secret_access_key]]
 
@@ -97,7 +111,7 @@ module Snowplow
         # and execute them in series. VACUUMs cannot be performed
         # inside of a transaction
         if config[:include].include?('vacuum')
-          vacuum_statements = [build_vacuum_statement(target[:table])] + shredded_statements.map(&:vacuum).uniq
+          vacuum_statements = [build_vacuum_statement(events_table)] + shredded_statements.map(&:vacuum).uniq
           vacuum_status = PostgresLoader.execute_queries(target, vacuum_statements)
           unless vacuum_status == []
             raise DatabaseLoadError, Sanitization.sanitize_message("#{vacuum_status[1]} error executing VACUUM statements: #{vacuum_status[0]}: #{vacuum_status[2]}", credentials)
@@ -106,7 +120,7 @@ module Snowplow
 
         # ANALYZE statements should be executed after VACUUM statements.
         unless config[:skip].include?('analyze')
-          analyze_statements = [build_analyze_statement(target[:table])] + shredded_statements.map(&:analyze).uniq
+          analyze_statements = [build_analyze_statement(events_table)] + shredded_statements.map(&:analyze).uniq
           analyze_status = PostgresLoader.execute_transaction(target, analyze_statements)
           unless analyze_status == []
             raise DatabaseLoadError, Sanitization.sanitize_message("#{analyze_status[1]} error executing ANALYZE statements: #{analyze_status[0]}: #{analyze_status[2]}", credentials)
@@ -125,15 +139,16 @@ module Snowplow
       # +config+:: the configuration options
       # +target+:: the configuration for this specific target
       # +s3+::     the Fog object for accessing S3
-      Contract Hash, Hash, FogStorage => ArrayOf[SqlStatements]
-      def self.get_shredded_statements(config, target, s3)
+      # +legacy+:: Whether we're using the old hadoop shred
+      Contract Hash, Hash, FogStorage, Bool => ArrayOf[SqlStatements]
+      def self.get_shredded_statements(config, target, s3, legacy=false)
 
         if config[:skip].include?('shred') # No shredded types to load
           []
         else
-          schema = extract_schema(target[:table])
+          schema = target[:schema]
 
-          ShreddedType.discover_shredded_types(s3, config[:aws][:s3][:buckets][:shredded][:good], schema).map { |st|
+          ShreddedType.discover_shredded_types(s3, config[:aws][:s3][:buckets][:shredded][:good], schema, legacy).map { |st|
 
             jsonpaths_file = st.discover_jsonpaths_file(s3, config[:aws][:s3][:buckets][:jsonpath_assets])
             if jsonpaths_file.nil?
@@ -141,7 +156,7 @@ module Snowplow
             end
 
             SqlStatements.new(
-              build_copy_from_json_statement(config, st.s3_objectpath, jsonpaths_file, st.table, target[:maxerror]),
+              build_copy_from_json_statement(config, st.s3_objectpath, jsonpaths_file, st.table, target[:maxError].to_i),
               build_analyze_statement(st.table),
               build_vacuum_statement(st.table)
             )
@@ -149,15 +164,26 @@ module Snowplow
         end
       end
 
-      # Looks at the events table to determine if there's
-      # a schema we should use for the shredded type tables.
+      # Generates the SQL statement for updating the
+      # manifest table
       #
       # Parameters:
-      # +events_table+:: the events table to load into
-      Contract String => Maybe[String]
-      def self.extract_schema(events_table)
-        parts = events_table.split(/\./)
-        if parts.size > 1 then parts[0] else nil end
+      # +schema+:: the name of the events schema being loaded
+      # +shredded_cardinality+:: the number of shredded child events and contexts tables loaded in this run
+      Contract String, Num => String
+      def self.get_manifest_statement(schema, shredded_cardinality)
+
+        schema = if schema.empty? then "" else "#{schema}." end
+        events_table = schema + "events"
+
+        "INSERT INTO #{schema}manifest
+          SELECT etl_tstamp, sysdate AS commit_tstamp, count(*) AS event_count, #{shredded_cardinality} AS shredded_cardinality
+          FROM #{events_table}
+          WHERE etl_tstamp IS NOT null
+          GROUP BY 1
+          ORDER BY etl_tstamp DESC
+          LIMIT 1;
+        "
       end
 
       # Replaces an initial "s3n" with "s3" in an S3 path
